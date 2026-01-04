@@ -1,18 +1,22 @@
 import { useState, useEffect, useCallback, useRef } from 'react';
 
-// Determine WebSocket URL based on environment
+/* ================= CONFIG ================= */
+
+const WS_ENABLED = import.meta.env.VITE_ENABLE_WS === 'true';
+
 function getWebSocketURL() {
+  if (!WS_ENABLED) return null;
+
   if (import.meta.env.VITE_WS_URL) {
     return import.meta.env.VITE_WS_URL;
   }
-  
+
   if (import.meta.env.DEV) {
     return 'ws://localhost:8001';
   }
-  
-  const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-  const host = window.location.host;
-  return `${protocol}//${host}`;
+
+  console.error('VITE_WS_URL is missing');
+  return null;
 }
 
 const WS_BASE_URL = getWebSocketURL();
@@ -21,9 +25,8 @@ const INITIAL_RECONNECT_DELAY = 2000;
 const MAX_RECONNECT_DELAY = 30000;
 const MAX_RECONNECT_ATTEMPTS = 5;
 
-/**
- * WebSocket connection states
- */
+/* ================= STATES ================= */
+
 export const ConnectionState = {
   CONNECTING: 'connecting',
   CONNECTED: 'connected',
@@ -31,9 +34,6 @@ export const ConnectionState = {
   ERROR: 'error',
 };
 
-/**
- * Available WebSocket channels
- */
 export const Channels = {
   LOGS: 'logs',
   ALERTS: 'alerts',
@@ -44,7 +44,8 @@ export const Channels = {
   ALL: 'all',
 };
 
-// Singleton WebSocket state
+/* ================= SINGLETON ================= */
+
 let globalWs = null;
 let globalClientId = null;
 let globalState = ConnectionState.DISCONNECTED;
@@ -54,6 +55,8 @@ let reconnectTimeout = null;
 let reconnectAttempts = 0;
 let currentDelay = INITIAL_RECONNECT_DELAY;
 let isConnecting = false;
+
+/* ================= HELPERS ================= */
 
 function notifyConnectionChange(state) {
   globalState = state;
@@ -65,10 +68,13 @@ function notifyMessage(msg) {
 }
 
 function connectGlobal() {
-  if (isConnecting || globalWs?.readyState === WebSocket.OPEN) {
+  if (!WS_ENABLED || !WS_BASE_URL) {
+    notifyConnectionChange(ConnectionState.DISCONNECTED);
     return;
   }
-  
+
+  if (isConnecting || globalWs?.readyState === WebSocket.OPEN) return;
+
   isConnecting = true;
   notifyConnectionChange(ConnectionState.CONNECTING);
 
@@ -80,11 +86,10 @@ function connectGlobal() {
       notifyConnectionChange(ConnectionState.CONNECTED);
       reconnectAttempts = 0;
       currentDelay = INITIAL_RECONNECT_DELAY;
-      
-      // Subscribe to all channels
-      if (globalWs?.readyState === WebSocket.OPEN) {
-        globalWs.send(JSON.stringify({ type: 'subscribe', channels: ['all'] }));
-      }
+
+      globalWs.send(
+        JSON.stringify({ type: 'subscribe', channels: ['all'] })
+      );
     };
 
     globalWs.onmessage = (event) => {
@@ -95,7 +100,7 @@ function connectGlobal() {
         }
         notifyMessage(data);
       } catch (e) {
-        console.error('Failed to parse WebSocket message:', e);
+        console.error('WS parse error', e);
       }
     };
 
@@ -109,29 +114,23 @@ function connectGlobal() {
       globalWs = null;
       globalClientId = null;
       notifyConnectionChange(ConnectionState.DISCONNECTED);
-      
-      if (reconnectAttempts < MAX_RECONNECT_ATTEMPTS && connectionListeners.size > 0) {
-        reconnectAttempts += 1;
+
+      if (reconnectAttempts < MAX_RECONNECT_ATTEMPTS) {
+        reconnectAttempts++;
         const delay = Math.min(currentDelay, MAX_RECONNECT_DELAY);
-        currentDelay = delay * 2;
-        
-        console.log(`WebSocket reconnecting in ${delay/1000}s (attempt ${reconnectAttempts}/${MAX_RECONNECT_ATTEMPTS})`);
-        
+        currentDelay *= 2;
         reconnectTimeout = setTimeout(connectGlobal, delay);
       }
     };
   } catch (e) {
     isConnecting = false;
     notifyConnectionChange(ConnectionState.ERROR);
-    console.error('Failed to create WebSocket:', e);
   }
 }
 
-/**
- * Custom hook for WebSocket connection (singleton pattern)
- */
+/* ================= HOOK ================= */
+
 export function useWebSocket({
-  channels = [Channels.ALL],
   autoConnect = true,
   onLog,
   onAlert,
@@ -144,127 +143,47 @@ export function useWebSocket({
   const [clientId, setClientId] = useState(globalClientId);
   const [lastMessage, setLastMessage] = useState(null);
   const [error, setError] = useState(null);
-  
-  const callbacksRef = useRef({ onLog, onAlert, onRemediation, onStats, onHealth, onMessage });
-  callbacksRef.current = { onLog, onAlert, onRemediation, onStats, onHealth, onMessage };
+
+  const callbacksRef = useRef({
+    onLog, onAlert, onRemediation, onStats, onHealth, onMessage
+  });
+
+  callbacksRef.current = {
+    onLog, onAlert, onRemediation, onStats, onHealth, onMessage
+  };
 
   useEffect(() => {
     const onConnectionChange = (state) => {
       setConnectionState(state);
-      if (state === ConnectionState.CONNECTED) {
-        setClientId(globalClientId);
-        setError(null);
-      } else if (state === ConnectionState.ERROR) {
-        setError('WebSocket connection error');
+      if (state === ConnectionState.ERROR) {
+        setError('WebSocket error');
       }
     };
 
     const onMsg = (data) => {
       setLastMessage(data);
-      const { onLog, onAlert, onRemediation, onStats, onHealth, onMessage } = callbacksRef.current;
-      
-      onMessage?.(data);
-      
+      const cb = callbacksRef.current;
+      cb.onMessage?.(data);
+
       switch (data.type) {
-        case 'connected':
-          setClientId(data.client_id);
-          break;
-        case 'log':
-          onLog?.(data.data || data);
-          break;
-        case 'alert':
-          onAlert?.(data.data || data);
-          break;
-        case 'remediation':
-          onRemediation?.(data.data || data);
-          break;
-        case 'stats':
-          onStats?.(data.data || data);
-          break;
-        case 'health':
-          onHealth?.(data.data || data);
-          break;
-        case 'error':
-          setError(data.message);
-          break;
+        case 'log': cb.onLog?.(data.data); break;
+        case 'alert': cb.onAlert?.(data.data); break;
+        case 'remediation': cb.onRemediation?.(data.data); break;
+        case 'stats': cb.onStats?.(data.data); break;
+        case 'health': cb.onHealth?.(data.data); break;
       }
     };
 
     connectionListeners.add(onConnectionChange);
     messageListeners.add(onMsg);
 
-    // Connect if needed
-    if (autoConnect && globalState !== ConnectionState.CONNECTED && !isConnecting) {
-      connectGlobal();
-    }
-
-    // Sync state
-    setConnectionState(globalState);
-    if (globalClientId) setClientId(globalClientId);
+    if (autoConnect) connectGlobal();
 
     return () => {
       connectionListeners.delete(onConnectionChange);
       messageListeners.delete(onMsg);
-      
-      // Disconnect only when no listeners remain
-      if (connectionListeners.size === 0) {
-        if (reconnectTimeout) {
-          clearTimeout(reconnectTimeout);
-          reconnectTimeout = null;
-        }
-        if (globalWs) {
-          globalWs.close();
-          globalWs = null;
-        }
-        reconnectAttempts = 0;
-        currentDelay = INITIAL_RECONNECT_DELAY;
-      }
     };
   }, [autoConnect]);
-
-  const sendMessage = useCallback((message) => {
-    if (globalWs?.readyState === WebSocket.OPEN) {
-      globalWs.send(JSON.stringify(message));
-      return true;
-    }
-    return false;
-  }, []);
-
-  const subscribe = useCallback((channelList) => {
-    return sendMessage({
-      type: 'subscribe',
-      channels: Array.isArray(channelList) ? channelList : [channelList],
-    });
-  }, [sendMessage]);
-
-  const unsubscribe = useCallback((channelList) => {
-    return sendMessage({
-      type: 'unsubscribe',
-      channels: Array.isArray(channelList) ? channelList : [channelList],
-    });
-  }, [sendMessage]);
-
-  const ping = useCallback(() => sendMessage({ type: 'ping' }), [sendMessage]);
-
-  const connect = useCallback(() => {
-    reconnectAttempts = 0;
-    currentDelay = INITIAL_RECONNECT_DELAY;
-    connectGlobal();
-  }, []);
-
-  const disconnect = useCallback(() => {
-    if (reconnectTimeout) {
-      clearTimeout(reconnectTimeout);
-      reconnectTimeout = null;
-    }
-    reconnectAttempts = MAX_RECONNECT_ATTEMPTS;
-    if (globalWs) {
-      globalWs.close();
-      globalWs = null;
-    }
-    setConnectionState(ConnectionState.DISCONNECTED);
-    setClientId(null);
-  }, []);
 
   return {
     connectionState,
@@ -272,12 +191,6 @@ export function useWebSocket({
     clientId,
     lastMessage,
     error,
-    sendMessage,
-    subscribe,
-    unsubscribe,
-    ping,
-    connect,
-    disconnect,
   };
 }
 
